@@ -75,13 +75,15 @@ Quizey is a backend REST API. There is no frontend yet; the API is the product s
 - Question types: **multiple choice**, **true/false**, and **multi-select**.
 - Publish validation per question type (option counts, correct-answer counts, rubric presence for manual-review questions).
 - **Version families via copy-on-write**: published exams are immutable; editing one creates a new version. Only one version per family is published at a time. Question options and full grading configuration — including rubrics — are deep-copied onto the new version.
-- Question **soft-delete** (`deleted_at`) when student answers exist, so grading and audit trails stay intact; hard delete when ungraded.
+- Question **soft-delete** (`deleted_at`) when student answers *or* an attempt paper reference the question, so grading and audit trails stay intact; hard delete when ungraded and unreferenced.
 - Question locking on publish (`locked_at`) — no edits after publication.
 
 ### Assessment delivery
 - **Attempt lifecycle**: start/resume, pause/resume, submit, lazy expiry, results.
 - Attempts are **family-aware** — a student resumes the in-progress attempt anywhere in the exam's version family and new attempts target the newest published version.
+- **Frozen attempt paper**: the question set *and* its order are selected and persisted exactly once, atomically with the attempt row at start. The paper is the source of truth for answer validation and grading; resume never recomputes or re-shuffles it. (Attempts created before this mechanism existed derive their paper from the exam version.)
 - Configurable exam rules, enforced at start: `max_attempts` (across the whole version family), an availability window (`available_from` / `available_until`), and an optional `access_code`.
+- **Seeded shuffle and question pools**: per-exam `shuffle_questions`, `shuffle_options`, and `pool_size` (draw a random subset of the question list). Selection and order are seeded per attempt, so a given attempt always resolves to the same paper; option order is a deterministic delivery-time permutation, and answers are graded by option identity — never by displayed position.
 - Timing model: per-attempt active-time limit (`duration_minutes`, or untimed), an absolute wall-clock `deadline_at`, and per-exam pause policy (`allow_pausing`). Attempt telemetry records what actually happened (`started_at`, real `submitted_at`, paused time), separate from the configured rules.
 - **Lazy expiration**: an attempt that runs out of active time or passes its wall-clock deadline is auto-finalized and graded on the next read/write. No background scheduler is required.
 
@@ -91,6 +93,7 @@ Quizey is a backend REST API. There is no frontend yet; the API is the product s
 - **Weighted questions** (`weight`) and **bonus questions** (`is_bonus`) with a defined, tested order of operations.
 - **Manual grading** for open-ended answers, driven by **rubrics**: a teacher-facing grading queue and a rubric-score grading endpoint.
 - Per-question feedback in results (correctness, awarded points, and, for manual items, criterion scores).
+- **Pass/fail verdicts**: an optional per-exam `passing_score` produces a pass/fail verdict as part of the graded result. (Persisting that verdict durably on the attempt record is one of the items currently being finished — see [Current status](#current-status-and-roadmap).)
 
 ### Integrity
 - An **append-only audit log** (ORM guards + database triggers) recording key grading/submission events.
@@ -169,7 +172,7 @@ Key structural properties:
 
 ## Domain model
 
-14 tables, versioned through Alembic migrations (12 domain tables + token blacklist + idempotency keys).
+16 tables, versioned through Alembic migrations (14 domain tables + token blacklist + idempotency keys).
 
 ```
 users ──< exams ──< questions ──< options
@@ -177,10 +180,10 @@ users ──< exams ──< questions ──< options
   │         │  └─ root_exam_id (self-referential → version family)
   │         │
   │         └──< attempts (state machine) ──< answers ──< answer_options (multi-select)
-  │                  │                              │
-  │                  │                              ├──< answer_evaluations ──< evaluation_criterion_scores
-  │                  │                              │
-  │                  │                              └── (Answer.selected_option_id → options)
+  │                  │  │                        │
+  │                  │  └──< attempt_questions   ├──< answer_evaluations ──< evaluation_criterion_scores
+  │                  │       (frozen paper)      │
+  │                  │                           └──< grade_overrides (append-only correction trail)
   │                  │
   │                  └── (timing telemetry: started_at, submitted_at, paused_at, total_paused_seconds)
   │
@@ -194,12 +197,14 @@ questions ──< rubrics ──< rubric_criteria      (grading contract for a q
 | Table | Purpose |
 |-------|---------|
 | `users` | Accounts with role (`student` / `teacher`); email/username unique |
-| `exams` | Assessment config: title, published flag, `max_attempts`, timing/access rules, `multi_select_penalty`, `exam_type`, `root_exam_id` (version family) |
+| `exams` | Assessment config: title, published flag, `max_attempts`, timing/access rules, assessment rules (shuffle, pools, passing score), `multi_select_penalty`, `exam_type`, `root_exam_id` (version family) |
 | `questions` | Question text, `question_type`, `points`, `weight`, `is_bonus`, `requires_manual_review`, `locked_at`, `deleted_at` (soft delete) |
 | `options` | Answer options with `is_correct` flag |
 | `attempts` | One row per attempt: `status` (state machine), timing telemetry, `score` |
 | `answers` | One row per (attempt, question) — unique constraint; single-select via `selected_option_id`, free-text via `text` |
 | `answer_options` | Join rows for multi-select selections (unique per answer+option) |
+| `attempt_questions` | The frozen per-attempt question paper: one row per selected question, position-ordered, written once inside the start-attempt transaction |
+| `grade_overrides` | Append-only grade-correction history (old score, new score, reason, grader, timestamp) |
 | `rubrics` | Grader-agnostic grading contract for a question (one-to-one) |
 | `rubric_criteria` | Evaluation axes with `label`, `max_points` (fractional), `position` |
 | `answer_evaluations` | Durable per-answer grading result (grader-agnostic `mechanism`); `pending` vs `graded` |
@@ -212,6 +217,7 @@ questions ──< rubrics ──< rubric_criteria      (grading contract for a q
 
 - **Version families via `root_exam_id`** (self-referential foreign key). A family is the root plus every exam whose `root_exam_id` points at it. `get_family_exam_ids()` resolves the full lineage from any member. Attempt limits are enforced across the family; in-progress attempts stay frozen to the version they started.
 - **Copy-on-write versioning.** Published exams are immutable. Editing one deep-copies questions, options (including correctness), and grading configuration (weight, bonus flag, manual-review flag, and rubric + criteria) into a new draft version. The old version remains live and gradable while the new draft is being edited.
+- **An attempt's paper is frozen at start.** Question selection, pools, and shuffle are computed exactly once — inside the transaction that creates the attempt — and persisted as that attempt's paper. A new exam version gets a fresh paper for *new* attempts; an in-progress attempt keeps the paper it started with.
 - **Grading results are snapshotted, not recomputed.** `evaluation_criterion_scores` stores the criterion label / max points / position at grade time, so a grade remains historically reproducible even if the rubric later evolves. Rubrics themselves ride on exam versioning (published content is immutable).
 - **Pending is not zero.** A manual answer awaiting review has `total_awarded = NULL` and is never presented as a numeric score. An attempt stays `SUBMITTED` while any manual evaluation is pending.
 - **Soft delete only where audit matters.** Questions with student answers are soft-deleted; ungraded questions are hard-deleted. Exams have no soft-delete column.
@@ -237,6 +243,7 @@ stateDiagram-v2
 
 Lifecycle rules worth calling out:
 
+- **Resume resumes the same paper.** The question set and its order are persisted at start, so a returning student is always handed exactly the paper they began — regardless of exam edits or rule changes since.
 - **Resume over restart.** A student with an `in_progress` or `paused` attempt anywhere in the family resumes it (after an expiry check) rather than starting a new one. Availability-window and access-code gates apply only to *new* starts — a frozen attempt is exempt.
 - **Lazy expiry, no scheduler.** On any read/write, an attempt whose active time is exhausted or whose wall-clock deadline has passed is atomically finalized (`submitted_at = now`) and graded in the same transaction. An expired attempt can never be resurrected.
 - **Pause stops the active clock, not the wall clock.** `total_paused_seconds` accumulates paused intervals; a configured `deadline_at` keeps advancing while paused.
@@ -289,11 +296,11 @@ raw performance
 
 1. A question marked `requires_manual_review` accepts free-text answers instead of option selections.
 2. On submit, a durable `pending` evaluation is created — the attempt stays `SUBMITTED`.
-3. The teacher pulls `GET /grading/exams/{id}/grading-queue` (oldest-submitted first, teacher-owned exams only).
-4. The teacher posts per-criterion `awarded_points` (0 ≤ awarded ≤ max, fractional allowed) to `POST /grading/answers/{id}/grade`. The server derives the total, validates every criterion (missing / unknown / duplicate / out-of-range → 422), persists evaluation + snapshots, and re-grades the attempt **in one transaction**. The grade route is idempotent.
+3. The teacher pulls the manual-grading queue (oldest-submitted first, teacher-owned exams only).
+4. The teacher posts per-criterion `awarded_points` (0 ≤ awarded ≤ max, fractional allowed) to the grading endpoint. The server derives the total, validates every criterion (missing / unknown / duplicate / out-of-range → 422), persists evaluation + snapshots, and re-grades the attempt **in one transaction**. The grade route is idempotent.
 5. Grading the final pending answer transitions the attempt to `GRADED`.
 
-Unanswered manual questions score `0` (never "pending"). Regrading in place is allowed (last-writer-wins); immutable override history is a planned follow-up.
+Unanswered manual questions score `0` (never "pending"). Rubric regrades update the authoritative evaluation, and an append-only **grade-override** table records every correction (old score, new score, reason, grader, timestamp) as a queryable history. The override model is implemented and locked by tests; wiring the teacher-facing override/history endpoints onto it is the current close-out work for this area (see [Current status](#current-status-and-roadmap)).
 
 ---
 
@@ -312,26 +319,15 @@ Beyond CRUD, the project invests in correctness and auditability:
 
 ## API surface
 
-All endpoints are prefixed with `/api/v1`.
+All endpoints live under a versioned prefix (`/api/v1/...`). At a glance, the surface covers:
 
-| Area | Endpoint | Purpose |
-|------|----------|---------|
-| **Auth** | `POST /auth/register`, `POST /auth/login` | Register (role student/teacher), log in → JWT pair |
-| | `POST /auth/refresh`, `POST /auth/logout` | Refresh access token, revoke refresh token |
-| | `GET /auth/me` | Current user profile |
-| **Exams** | `GET /exams`, `POST /exams` | List (teacher's) exams, create draft |
-| | `GET /exams/{id}`, `PUT /exams/{id}` | Read; update (or auto-create version if published) |
-| | `POST /exams/{id}/publish`, `POST /exams/{id}/version` | Publish with validation; explicit version clone |
-| | `POST /exams/{id}/questions`, `PUT /exams/{id}/questions/{qid}`, `DELETE /exams/{id}/questions/{qid}` | Question CRUD |
-| | `POST /questions/{qid}/options`, `PUT /questions/{qid}/options/{oid}` | Option CRUD |
-| **Attempts** | `POST /exams/{id}/attempts`, `GET /exams/{id}/attempts` | Start (or resume), list attempts |
-| | `GET /attempts/{id}`, `GET /attempts/{id}/result` | Attempt detail, graded result with per-question feedback |
-| | `POST /attempts/{id}/answers` | Submit an answer (idempotent) |
-| | `POST /attempts/{id}/pause`, `POST /attempts/{id}/resume` | Pause / resume (per exam policy) |
-| | `POST /attempts/{id}/submit` | Submit for grading (idempotent) |
-| **Grading** | `GET /grading/exams/{id}/grading-queue` | Pending manual-review answers (teacher) |
-| | `POST /grading/answers/{id}/grade` | Persist rubric scores (teacher, idempotent) |
-| **Health** | `GET /health` | Liveness check |
+| Area | What it exposes |
+|------|-----------------|
+| **Auth** | Registration (student/teacher), login → JWT pair, token refresh, logout (revocation), current-user profile |
+| **Exams & content** | Exam CRUD and publishing with per-question-type validation; question and option management; explicit version creation; per-exam assessment-rule read/update (copy-on-write on published exams) |
+| **Attempts** | Start (or resume), frozen question-paper delivery, per-question answering, pause/resume, submit, attempt detail, graded result with per-question feedback |
+| **Grading** | Teacher-facing manual-grading queue and rubric-score grading; grade-override history (endpoint wiring in progress) |
+| **Health** | Liveness check |
 
 ---
 
@@ -339,7 +335,7 @@ All endpoints are prefixed with `/api/v1`.
 
 The test suite is the project's primary quality gate. I run it as part of every milestone.
 
-- **393 tests pass** (plus 23 state-machine subtests), run with `pytest` against in-memory SQLite with foreign keys enabled. Verified on the current tree.
+- **460 tests pass** (plus 23 subtests), run with `pytest` against in-memory SQLite with foreign keys enabled. Verified on the current tree.
 - **Organization:**
   - `tests/factories/` — factory functions for users, exams, questions, options, attempts, answers.
   - `tests/scenarios/` — reusable end-to-end scenario builders (full exam-taking flow).
@@ -351,18 +347,20 @@ The test suite is the project's primary quality gate. I run it as part of every 
 |------|-------------------|
 | **Auth** (34 tests) | Registration validation, login, refresh, logout/blacklist, profile |
 | **Attempt lifecycle** (28 tests) | Start/resume, pause/resume, lazy expiry (all four timing cases), double-submit protection |
+| **Attempt paper** (27 tests) | Frozen-paper selection, seeded shuffle & pools, deterministic option order, paper-scoped answering and grading, legacy fallback |
 | **Attempt service** (12 tests) + **concurrency** (6 tests) | Family-aware behavior, exactly-one-graded under race |
 | **Grading — multi-select** (37 tests) | Scoring matrix, partial credit, penalty, payload rules, publish validation |
 | **Grading — manual** (34 tests) | Pending-vs-zero semantics, rubric normalization, queue, grade validation, idempotent regrade, SUBMITTED → GRADED transition |
 | **Grading — weight/bonus** (12 tests) | Order-of-operations, bonus never negative, percentage not capped |
 | **Grading — rubric** (11 tests) | Model relationships, version-copy preservation |
 | **Assessment rules** (32 tests) | Availability window, access code, family-wide max attempts, frozen-at-start |
+| **Exam rules endpoints** (24 tests) | Rule validation, copy-on-write versioning, serializer round-trip |
 | **Exam service** (35) + **question service** (17) + **exam routes** (13) | CRUD, publish validation, copy-on-write versioning |
 | **Idempotency** (11 tests) | Exactly-once, replay, stale-lock cleanup |
 | **Transactions** (7 tests) | Nestable all-or-nothing semantics, rollback on failure |
 | **RBAC** (11 tests) | Role gates at decorator and route level |
 | **Audit log** (10 tests) | Append-only enforcement at ORM and trigger level |
-| **Model tests** (82 tests) | Per-model constraints, relationships, soft delete, state machine |
+| **Model tests** (98 tests) | Per-model constraints, relationships, soft delete, state machine; includes the frozen-paper model suite (9) and the append-only grade-override model suite (7) |
 
 The suite includes regression tests for bugs found during manual QA (null-crash handling, version-title overflow, N+1 query elimination, dropped grading config during versioning).
 
@@ -396,7 +394,7 @@ The architecture intentionally sequences this: the data model (attempts, grades,
 
 - Environment-based configuration (`development` / `testing` / `production`) loaded from `.env`.
 - MySQL for development (PyMySQL driver); in-memory SQLite for tests.
-- Alembic migrations via Flask-Migrate (12 migrations, one per schema change).
+- Alembic migrations via Flask-Migrate (16 migrations, one per schema change).
 - A `/health` liveness endpoint.
 - A CLI command for idempotency-key cleanup.
 
@@ -457,11 +455,15 @@ The decisions below are the ones that most shape the system — each is document
 
 12. **Modular monolith with a strict layering rule.** Routes are thin, services hold business logic, models define schema. This keeps the codebase navigable and testable as it grows.
 
+13. **The frozen attempt paper.** Question selection (pools, shuffle) is computed exactly once — inside the transaction that creates the attempt — and persisted as that attempt's paper, which is the source of truth for answering and grading. Resume, re-delivery, and grading all read the same immutable rows, so no code path can hand a student a different paper than the one their answers are graded against.
+
+14. **An append-only correction trail for grades.** Human grade corrections never rewrite history: each override appends a row (old score, new score, reason, grader, timestamp), while the evaluation remains the authoritative current grade — the same "current state + immutable history" split used for rubric snapshots.
+
 ---
 
 ## Current status and roadmap
 
-**Status: Phase 2 of 3, actively in progress.** Phase 1 (foundation) is complete. The Phase 2 milestones below reflect what is verified in the code and test suite.
+**Status: Phase 2 of 3, actively in progress.** Phase 1 (foundation) is complete, and Stage 2.1 — the assessment-platform core — is substantially built, with a short close-out list remaining. The milestones below reflect what is verified in the code and test suite.
 
 ### Phase 1 — Foundation ✅ Complete
 Authentication, exam/question/option management, publish + versioning, attempts, auto-grading, and the full test suite.
@@ -470,13 +472,21 @@ Authentication, exam/question/option management, publish + versioning, attempts,
 
 | Stage | Status |
 |-------|--------|
-| **2.1 Assessment platform** | Prerequisites (state machine, idempotency, transactions, concurrency, RBAC, audit log) done. **2.1.1 Attempt lifecycle done** (pause/resume, expiry, telemetry). **2.1.2 Advanced grading — steps 1–6 done** (strategy pattern, partial credit, weight/bonus, rubrics, manual grading queue); **steps 7–8 pending** (grade-override history, full combination matrix). **2.1.3 Assessment rules — partial** (availability window, access code, family-wide max attempts enforced; seeded shuffle, question pools, passing score not built). **2.1.4 Integrity & audit — foundation done, wiring remains** (role gates present; broader audit wiring + immutable-submission guard pending). |
+| **2.1 Assessment platform** | **2.1.1 Attempt lifecycle done** (pause/resume, expiry, telemetry — 73 attempt tests). **2.1.2 Advanced grading — core done** (strategy pattern, partial credit, weight/bonus, rubrics, manual grading queue, append-only override model); override/history endpoint wiring in progress. **2.1.3 Assessment rules done** (availability window, access code, family-wide max attempts, seeded question shuffle, question pools, passing score, rules endpoints — with copy-on-write on published exams). **2.1.4 Integrity & audit — role gates done and tested; audit wiring partial** (submission and manual grading are logged; broader coverage pending). |
 | **2.2 Publishing & version management** | Not started — scheduling, archive, version diff, rollback. |
 | **2.3 Question bank** | Not started — reusable question library, tags, search. |
 | **2.4 Instructor experience** | Not started — dashboard, analytics, bulk tools, exports. |
 | **2.5 Student experience** | Not started — dashboard, progress, notifications. |
 | **2.6 Platform services** | Not started — background jobs (Redis/Celery), caching, search, security hardening. |
 | **2.7 DevOps & production** | Not started — containerization, CI/CD, monitoring, backups. |
+
+**Currently in progress — Stage 2.1 close-out:**
+
+- Wiring the grade-override/history endpoints onto the append-only override model.
+- Persisting the pass/fail verdict durably on the attempt record.
+- Extending audit coverage to exam publish/version and auth events.
+- Deciding whether per-question negative marking belongs in the scoring pipeline (it was planned, never built — the decision is to implement it or remove the vestige).
+- An end-to-end API regression pass across the full lifecycle.
 
 ### Phase 3 — AI-native learning platform 🔷 Planned
 AI-assisted authoring, intelligent grading with human-in-the-loop, personalized learning, a multi-agent platform, and the AI engineering layer (prompt versioning, evaluation, observability). See [AI-first direction](#ai-first-direction) for detail. No Phase 3 code exists yet.
